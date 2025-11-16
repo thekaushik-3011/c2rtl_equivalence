@@ -1,56 +1,76 @@
-// inputs/golden_model.c
+// inputs/golden_model.c - 4-tap FIR Filter
 #include "golden_model.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-static uint32_t sum;
-static uint8_t in_valid_d;
-static uint32_t in_data_d;
+// FIR coefficients (fixed-point: 16-bit, scale 2^12)
+static const int16_t COEFF[4] = {819, 1638, 2048, 1638};  // Approximates [0.2, 0.4, 0.5, 0.4]
+
+static int16_t buffer[4];    // Circular buffer for last 4 samples
+static uint8_t buf_idx;      // Current write position
+static uint8_t in_valid_d;   // Pipeline delay register
+static int16_t in_data_d;    // Pipeline delay register
+static int64_t acc;          // Accumulator for MAC operations
+static uint8_t mac_stage;    // MAC pipeline stage counter
 
 void golden_init(void) {
-    sum = 0;
+    for (int i = 0; i < 4; i++) buffer[i] = 0;
+    buf_idx = 0;
     in_valid_d = 0;
     in_data_d = 0;
+    acc = 0;
+    mac_stage = 0;
 }
 
 void golden_step(uint8_t in_valid, uint32_t in_data, uint8_t *out_valid, uint32_t *out_data) {
-    // pipeline behavior must match RTL. We'll apply same ordering:
-    // - capture pipelined registers
-    // - if in_valid, sum += in_data (mod 32)
-    // - out_valid = previous in_valid (in_valid_d)
-    // - if out_valid, out_data = sum
-
-    // update pipeline registers (but keep previous values for outputs)
+    // Extract 16-bit signed input from lower 16 bits
+    int16_t sample = (int16_t)(in_data & 0xFFFF);
+    
     uint8_t prev_in_valid_d = in_valid_d;
-    uint32_t prev_sum = sum;
-
-    // update sum as RTL does on same cycle as sampling
+    uint8_t will_output = 0;
+    int32_t result = 0;
+    
+    // === STAGE 1: Input sampling ===
     if (in_valid) {
-        sum = prev_sum + in_data; // modulo 2^32 by uint32_t wrap-around
+        buffer[buf_idx] = sample;
+        buf_idx = (buf_idx + 1) & 0x3;  // Wrap around: 0->1->2->3->0
     }
-
-    // shift pipeline: sample input into delayed registers
+    
+    // === STAGE 2: MAC operation (takes 4 cycles) ===
+    if (prev_in_valid_d && mac_stage < 4) {
+        // Multiply-accumulate: read from buffer in reverse order
+        uint8_t read_idx = (buf_idx - 1 - mac_stage) & 0x3;
+        acc += (int64_t)buffer[read_idx] * COEFF[mac_stage];
+        mac_stage++;
+        
+        if (mac_stage == 4) {
+            // MAC complete, scale down from fixed-point
+            result = (int32_t)(acc >> 12);  // Divide by 2^12
+            acc = 0;
+            mac_stage = 0;
+            will_output = 1;
+        }
+    } else if (!prev_in_valid_d) {
+        mac_stage = 0;
+        acc = 0;
+    }
+    
+    // Pipeline input for next cycle
     in_valid_d = in_valid;
-    in_data_d = in_data;
-
-    // produce outputs matching RTL: out_valid = prev in_valid_d (before we updated in_valid_d)
-    *out_valid = prev_in_valid_d;
-    if (prev_in_valid_d) {
-        // RTL outputs sum (which has just been updated above to include the new input).
-        // Because of ordering, prev_sum + in_data == new sum when prev_in_valid_d==1,
-        // but the pipeline relation is matched by the ordering used here.
-        *out_data = sum;
-    } else {
-        *out_data = 0;
-    }
+    in_data_d = sample;
+    
+    // === OUTPUTS ===
+    *out_valid = will_output;
+    *out_data = will_output ? (uint32_t)(result & 0xFFFF) : 0;
 }
 
-// helper to parse hex prefix "0x"
-static uint32_t parse_hex(const char *s) {
+// CSV runner (same structure as before)
+static int16_t parse_signed16(const char *s) {
     if (!s) return 0;
-    return (uint32_t)strtoul(s, NULL, 0);
+    long val = strtol(s, NULL, 0);
+    return (int16_t)(val & 0xFFFF);
 }
 
 int golden_run_csv(const char *in_csv, const char *out_csv) {
@@ -66,14 +86,11 @@ int golden_run_csv(const char *in_csv, const char *out_csv) {
         return 1;
     }
 
-    // consume header if present
     char line[256];
     if (!fgets(line, sizeof(line), inf)) {
-        fclose(inf);
-        fclose(outf);
+        fclose(inf); fclose(outf);
         return 1;
     }
-    // if first line contains "id" assume header, else rewind
     if (strstr(line, "id") == NULL) {
         fseek(inf, 0, SEEK_SET);
     }
@@ -87,16 +104,15 @@ int golden_run_csv(const char *in_csv, const char *out_csv) {
 
     while (fgets(line, sizeof(line), inf)) {
         if (sscanf(line, "%lu,%63s", &id, in_s) >= 1) {
-            uint32_t in = parse_hex(in_s);
+            int16_t in = parse_signed16(in_s);
             uint8_t out_valid;
             uint32_t out_data;
-            // call golden per vector: drive in_valid=1 for each vector (streaming)
-            golden_step(1, in, &out_valid, &out_data);
-            // Note: If you want to emulate idle cycles, adapt the CSV format.
-            fprintf(outf, "%lu,%lu,0x%08x,0x%08x,0x%08x\n", cycle, id, in, out_data, out_data);
+            
+            golden_step(1, (uint32_t)in, &out_valid, &out_data);
+            
+            fprintf(outf, "%lu,%lu,0x%04x,0x%04x,0x%04x\n", 
+                    cycle, id, in & 0xFFFF, out_data & 0xFFFF, out_data & 0xFFFF);
             cycle++;
-            // Optionally insert zero-valid cycles between vectors if desired
-            // e.g., golden_step(0, 0, &out_valid, &out_data);
         }
     }
 
@@ -104,5 +120,3 @@ int golden_run_csv(const char *in_csv, const char *out_csv) {
     fclose(outf);
     return 0;
 }
-
-
