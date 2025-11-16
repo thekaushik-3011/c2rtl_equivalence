@@ -1,4 +1,4 @@
-// rtl/top.v - 4-tap FIR Filter (ACTUALLY FIXED)
+// rtl/top.v - 4-tap FIR Filter (WIDTH-SAFE)
 `timescale 1ns/1ps
 module top (
     input  wire         clk,
@@ -23,6 +23,13 @@ module top (
   wire signed [15:0] sample;
   assign sample = in_data[15:0];
   
+  // Variables for MAC computation
+  reg [1:0] read_idx;
+  reg signed [15:0] tap_val;
+  reg signed [15:0] coeff_val;
+  reg signed [31:0] product;
+  reg signed [47:0] next_acc;
+  
   integer i;
   
   always @(posedge clk or negedge rst_n) begin
@@ -42,44 +49,48 @@ module top (
         buf_idx <= buf_idx + 2'd1;
       end
       
-      // Default output
+      // Default outputs
       out_valid <= 1'b0;
       out_data <= 32'h0;
       
       // MAC state machine
       if (in_valid_d && mac_stage < 4) begin
-        reg [1:0] idx;
-        reg signed [15:0] tap;
-        reg signed [15:0] c;
-        reg signed [31:0] prod;
+        // Calculate buffer read index (circular)
+        read_idx = buf_idx - 2'd1 - mac_stage[1:0];
+        tap_val = buffer[read_idx];
         
-        idx = buf_idx - 2'd1 - mac_stage[1:0];
-        tap = buffer[idx];
-        
+        // Select coefficient
         case (mac_stage[1:0])
-          2'd0: c = COEFF0;
-          2'd1: c = COEFF1;
-          2'd2: c = COEFF2;
-          2'd3: c = COEFF3;
+          2'd0: coeff_val = COEFF0;
+          2'd1: coeff_val = COEFF1;
+          2'd2: coeff_val = COEFF2;
+          2'd3: coeff_val = COEFF3;
         endcase
         
-        prod = tap * c;
-        acc <= acc + prod;
+        // Compute product (32-bit result from 16x16)
+        product = tap_val * coeff_val;
+        
+        // Accumulate with proper width extension
+        next_acc = acc + {{16{product[31]}}, product};  // Sign-extend to 48 bits
+        acc <= next_acc;
         mac_stage <= mac_stage + 3'd1;
         
-        // Output when done
+        // Output when MAC completes
         if (mac_stage == 3'd3) begin
           out_valid <= 1'b1;
-          out_data <= {16'h0, (acc + prod) >>> 12};  // Include current multiply!
+          // Scale down by 2^12 and truncate to 16 bits
+          out_data <= {16'h0, next_acc[27:12]};
           mac_stage <= 3'd0;
           acc <= 48'sd0;
         end
         
       end else if (!in_valid_d && mac_stage != 0) begin
+        // Reset MAC if input stream stops
         mac_stage <= 3'd0;
         acc <= 48'sd0;
       end
       
+      // Pipeline input valid signal
       in_valid_d <= in_valid;
     end
   end
